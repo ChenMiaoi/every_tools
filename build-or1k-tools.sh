@@ -8,10 +8,13 @@ WORK_DIR="$HOME/work/openrisc"
 BUILD_BINUTILS=false
 BUILD_GCC=false
 BUILD_GDB=false
+BUILD_QEMU=false
+BUILD_LINUX=false
 USE_GMP=false
 USE_MPFR=false
 USE_MPC=false
 CLEAN_CACHE=false
+CLEAN_TARGET="all"
 
 # Colors for output
 RED='\033[0;31m'
@@ -516,6 +519,8 @@ build_gdb() {
     exit 1
   }
 
+  build_extra
+
   pushd binutils-gdb/build-gdb >/dev/null || {
     error "Failed to change to GDB build directory"
     exit 1
@@ -559,9 +564,152 @@ build_gdb() {
   success "GDB built and installed successfully"
 }
 
-clean_cache() {
-  info "Cleaning build caches and temporary files"
+# Add QEMU build function
+build_qemu() {
+  local qemu_version="9.2.3"
+  local qemu_dir="qemu-${qemu_version}"
+  local qemu_archive="${qemu_dir}.tar.xz"
+  local qemu_url="https://download.qemu.org/${qemu_archive}"
 
+  info "Building QEMU ${qemu_version}"
+
+  # Download QEMU if not exists
+  if [ ! -f "${WORK_DIR}/${qemu_archive}" ]; then
+    info "Downloading QEMU"
+    wget "${qemu_url}" || {
+      error "Failed to download QEMU"
+      return 1
+    }
+  fi
+
+  # Extract QEMU
+  if [ ! -d "${WORK_DIR}/${qemu_dir}" ]; then
+    info "Extracting QEMU"
+    tar -xJf "${WORK_DIR}/${qemu_archive}" || {
+      error "Failed to extract QEMU"
+      return 1
+    }
+  fi
+
+  sudo apt-get install -y libglib2.0-dev pkgconf ninja-build python3-venv python3-pip python3-full || {
+    error "Failed to install dependencies"
+    return 1
+  }
+
+  # python3 -m pip install -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple --upgrade pip || {
+  #   error "cannot set pypi tsinghua mirror"
+  #   return 1
+  # }
+
+  # python3 -m pip install --upgrade pip || {
+  #   error "cannot upgrade pip"
+  #   return 1
+  # }
+
+  # pip config set global.index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple || {
+  #   error "cannot set pypi tsinghua mirror"
+  #   return 1
+  # }
+
+  # Build QEMU
+  pushd "${WORK_DIR}/${qemu_dir}" >/dev/null || {
+    error "Failed to enter QEMU directory"
+    return 1
+  }
+
+  info "Configuring QEMU"
+  ./configure --prefix="$OPENRISC_TOOL_PREFIX/qemu" \
+    --target-list=or1k-softmmu,or1k-linux-user || {
+    error "QEMU configuration failed"
+    popd >/dev/null
+    return 1
+  }
+
+  info "Building QEMU"
+  make -j$(nproc) || {
+    error "QEMU build failed"
+    popd >/dev/null
+    return 1
+  }
+
+  info "Installing QEMU"
+  make install || {
+    error "QEMU installation failed"
+    popd >/dev/null
+    return 1
+  }
+
+  popd >/dev/null
+
+  # Add QEMU to PATH in .bashrc
+  local bashrc="$HOME/.bashrc"
+  local qemu_path_line="export PATH=\$PATH:${OPENRISC_TOOL_PREFIX}/qemu/bin"
+
+  if ! grep -q "${qemu_path_line}" "$bashrc"; then
+    info "Adding QEMU to PATH in ${bashrc}"
+    echo "${qemu_path_line}" >>"$bashrc" || {
+      error "Failed to update ${bashrc}"
+      return 1
+    }
+    # Source the updated .bashrc
+    source "$bashrc"
+  else
+    source "$bashrc"
+  fi
+
+  success "QEMU ${qemu_version} built and installed successfully"
+  return 0
+}
+
+# Add Linux kernel build function
+build_linux() {
+  info "Building Linux kernel for OpenRISC"
+
+  # Clone Linux repository if not exists
+  if [ ! -d "linux" ]; then
+    info "Cloning Linux repository"
+    git clone --depth 1 https://github.com/openrisc/linux.git linux || {
+      error "Failed to clone Linux repository"
+      return 1
+    }
+  fi
+
+  pushd linux >/dev/null || {
+    error "Failed to enter Linux directory"
+    return 1
+  }
+
+  # Set up environment for cross-compilation
+  export ARCH=openrisc
+  export CROSS_COMPILE=or1k-elf-
+
+  # Check if toolchain is in PATH
+  if ! command -v ${CROSS_COMPILE}gcc >/dev/null 2>&1; then
+    error "OpenRISC toolchain not found in PATH. Please build toolchain first or add to PATH."
+    popd >/dev/null
+    return 1
+  fi
+
+  info "Configuring Linux kernel"
+  make defconfig || {
+    error "Failed to configure Linux kernel"
+    popd >/dev/null
+    return 1
+  }
+
+  info "Building Linux kernel"
+  make -j$(nproc) || {
+    error "Failed to build Linux kernel"
+    popd >/dev/null
+    return 1
+  }
+
+  popd >/dev/null
+  success "Linux kernel built successfully"
+  return 0
+}
+
+clean_toolchain() {
   # Remove build directories
   local build_dirs=(
     "binutils-gdb/build-binutils"
@@ -616,36 +764,10 @@ clean_cache() {
   local bashrc="$HOME/.bashrc"
   local path_line="export PATH=\$PATH:$OPENRISC_PREFIX/bin"
 
-  if [ -f "$bashrc" ] && grep -q "$path_line" "$bashrc"; then
-    info "Removing PATH modification from $bashrc"
+  remove_path_entry "$bashrc" "$path_line"
+}
 
-    # Use sed to remove the line (works across different sed implementations)
-    sed -i "\|$path_line|d" "$bashrc" || {
-      error "Failed to modify $bashrc"
-      return 1
-    }
-
-    # Also remove from current environment
-    export PATH=$(echo "$PATH" | sed "s|:$OPENRISC_PREFIX/bin||")
-  fi
-
-  # Remove downloaded source tarballs
-  # local source_files=(
-  #   "gmp-6.1.0.tar.xz"
-  #   "mpfr-3.1.6.tar.xz"
-  #   "mpc-1.0.3.tar.gz"
-  # )
-
-  # for file in "${source_files[@]}"; do
-  #   if [ -f "$WORK_DIR/$file" ]; then
-  #     info "Removing $file"
-  #     rm -f "$WORK_DIR/$file" || {
-  #       error "Failed to remove $file"
-  #       return 1
-  #     }
-  #   fi
-  # done
-
+clean_extra() {
   # Remove extracted source directories (but keep symlinks in gcc/)
   local source_dirs=(
     "gmp-6.1.0"
@@ -684,8 +806,92 @@ clean_cache() {
       }
     fi
   done
+}
 
-  success "Build caches and temporary files cleaned successfully"
+clean_qemu() {
+  local qemu_version="9.2.3"
+  local qemu_files="qemu-${qemu_version}"
+  local qemu_install_dir="${OPENRISC_TOOL_PREFIX}/qemu"
+
+  if [ -d "${qemu_files}" ]; then
+    info "Clean Qemu Build Cache"
+    make -C "$WORK_DIR/$qemu_files" distclean || {
+      error "Failed to clean Qemu Build Cache"
+      return 1
+    }
+  fi
+
+  if [ -d "${qemu_install_dir}" ]; then
+    info "Removing installed QEMU from ${qemu_install_dir}"
+    rm -rf "${qemu_install_dir}" || {
+      error "Failed to remove QEMU installation"
+      return 1
+    }
+  fi
+
+  # Remove QEMU PATH from .bashrc
+  local bashrc="$HOME/.bashrc"
+  local qemu_path_line="export PATH=\$PATH:${qemu_install_dir}/bin"
+
+  remove_path_entry "$bashrc" "$qemu_path_line"
+}
+
+clean_linux() {
+  info "Clean Linux Build Cache"
+  if [ -d "${WORK_DIR}/linux" ]; then
+    make -C "${WORK_DIR}/linux" mrproper || {
+      error "Failed to clean Linux Build Cache"
+      return 1
+    }
+  fi
+}
+
+remove_path_entry() {
+  local file="$1"
+  local pattern="$2"
+
+  if [ -f "$file" ] && grep -q "$pattern" "$file"; then
+    info "Removing PATH entry from ${file}"
+    sed -i "\|${pattern}|d" "$file" || {
+      error "Failed to modify ${file}"
+      return 1
+    }
+
+    # Also remove from current environment
+    export PATH=$(echo "$PATH" | sed "s|:${pattern#*=}||")
+  fi
+}
+
+clean_cache() {
+  local target="${1:-all}" # Default to clean all if no target specified
+  info "Starting clean operation for target: $target"
+
+  case "$target" in
+  qemu)
+    clean_qemu || return $?
+    ;;
+  linux)
+    clean_linux || return $?
+    ;;
+  toolchain)
+    clean_toolchain || return $?
+    ;;
+  extra)
+    clean_extra || return $?
+    ;;
+  all)
+    clean_qemu || return $?
+    clean_linux || return $?
+    clean_extra || return $?
+    clean_toolchain || return $?
+    ;;
+  *)
+    error "Invalid clean target: $target. Valid targets are: binutils, gcc, newlib, qemu, linux, toolchain, all"
+    return 1
+    ;;
+  esac
+
+  success "Clean operation completed for target: $target"
   return 0
 }
 
@@ -727,8 +933,22 @@ parse_arguments() {
       BUILD_GDB=true
       shift
       ;;
+    --build-qemu)
+      BUILD_QEMU=true
+      shift
+      ;;
+    --build-linux)
+      BUILD_LINUX=true
+      shift
+      ;;
+    --clean=*)
+      CLEAN_CACHE=true
+      CLEAN_TARGET="${1#*=}"
+      shift
+      ;;
     --clean)
       CLEAN_CACHE=true
+      CLEAN_TARGET="all" # Default to clean all
       shift
       ;;
     *)
@@ -744,7 +964,17 @@ main() {
   parse_arguments "$@"
 
   if [ "$CLEAN_CACHE" = true ]; then
-    clean_cache
+    clean_cache "$CLEAN_TARGET"
+    exit $?
+  fi
+
+  if $BUILD_QEMU; then
+    build_qemu
+    exit $?
+  fi
+
+  if $BUILD_LINUX; then
+    build_linux
     exit $?
   fi
 
@@ -761,10 +991,10 @@ main() {
   if $USE_MPFR; then setup_mpfr; fi
   if $USE_MPC; then setup_mpc; fi
 
-  build_extra
-
   # Build components as requested
   if $BUILD_BINUTILS; then build_binutils; fi
+
+  setup_prefix
 
   if $BUILD_GCC; then
     build_gcc_stage1
