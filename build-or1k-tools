@@ -1,0 +1,485 @@
+#!/bin/bash
+
+# Global variables
+OPENRISC_PREFIX="/opt/toolchain/or1k-elf"
+WORK_DIR="$HOME/work/openrisc"
+BUILD_BINUTILS=false
+BUILD_GCC=false
+BUILD_GDB=false
+USE_GMP=false
+USE_MPFR=false
+USE_MPC=false
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+NC='\033[0m' # No Color
+
+# Function to print error messages
+error() {
+  echo -e "${RED}[ERROR]${NC} $1"
+}
+
+# Function to print success messages
+success() {
+  echo -e "${GREEN}[SUCCESS]${NC} $1"
+}
+
+# Function to print info messages
+info() {
+  echo -e "${YELLOW}[INFO]${NC} $1"
+}
+
+# Function to setup build dependencies (Ubuntu/Debian only)
+setup_dependency() {
+    info "Installing required build dependencies for Ubuntu/Debian"
+    
+    # Check if we're on a Debian-based system
+    if ! command -v apt-get >/dev/null 2>&1; then
+        error "This script currently only supports Ubuntu/Debian for dependency installation"
+        error "Please install the following packages manually:"
+        error "gcc, g++, make, cmake, autogen, automake, autoconf, zlib1g-dev, texinfo, build-essential, flex, bison, git, wget, xz-utils"
+        return 1
+    fi
+
+    # Update package lists
+    sudo apt-get update || {
+        error "Failed to update package lists"
+        return 1
+    }
+    
+    # Install required packages
+    sudo apt-get install -y \
+        gcc \
+        g++ \
+        make \
+        cmake \
+        autogen \
+        automake \
+        autoconf \
+        zlib1g-dev \
+        texinfo \
+        build-essential \
+        flex \
+        bison \
+        git \
+        wget \
+        xz-utils \
+        || {
+            error "Failed to install dependencies"
+            return 1
+        }
+    
+    success "Build dependencies installed successfully"
+    return 0
+}
+
+# Function to check and create work directory
+setup_work_dir() {
+  if [ ! -d "$WORK_DIR" ]; then
+    info "Creating work directory at $WORK_DIR"
+    mkdir -p "$WORK_DIR" || {
+      error "Failed to create work directory"
+      exit 1
+    }
+  fi
+  cd "$WORK_DIR" || {
+    error "Failed to change to work directory"
+    exit 1
+  }
+}
+
+# Function to set up prefix in PATH
+setup_prefix() {
+  local bashrc="$HOME/.bashrc"
+  local path_line="export PATH=\$PATH:$OPENRISC_PREFIX/bin"
+
+  if ! grep -q "$path_line" "$bashrc"; then
+    info "Adding $OPENRISC_PREFIX/bin to PATH in $bashrc"
+    echo "$path_line" >>"$bashrc" || {
+      error "Failed to update $bashrc"
+      exit 1
+    }
+    source "$bashrc"
+  fi
+}
+
+# Function to clone repositories
+clone_repos() {
+  # Clone GCC if not exists
+  if [ ! -d "gcc" ]; then
+    info "Cloning GCC repository"
+    git clone --depth 1 git://gcc.gnu.org/git/gcc.git gcc || {
+      error "Failed to clone GCC"
+      exit 1
+    }
+  fi
+
+  # Clone binutils-gdb if not exists
+  if [ ! -d "binutils-gdb" ]; then
+    info "Cloning binutils-gdb repository"
+    git clone --depth 1 git://sourceware.org/git/binutils-gdb.git binutils-gdb || {
+      error "Failed to clone binutils-gdb"
+      exit 1
+    }
+  fi
+
+  # Clone newlib if not exists
+  if [ ! -d "newlib" ]; then
+    info "Cloning newlib repository"
+    git clone --depth 1 git://sourceware.org/git/newlib-cygwin.git newlib || {
+      error "Failed to clone newlib"
+      exit 1
+    }
+  fi
+}
+
+# Function to setup GMP
+setup_gmp() {
+  if [ ! -d "gmp-6.1.0" ]; then
+    info "Downloading and setting up GMP"
+    wget https://gmplib.org/download/gmp/gmp-6.1.0.tar.xz || {
+      error "Failed to download GMP"
+      exit 1
+    }
+    tar -xf gmp-6.1.0.tar.xz || {
+      error "Failed to extract GMP"
+      exit 1
+    }
+    rm gmp-6.1.0.tar.xz
+  fi
+
+  if [ ! -L "gcc/gmp" ]; then
+    ln -s ../gmp-6.1.0 gcc/gmp || {
+      error "Failed to create symlink for GMP"
+      exit 1
+    }
+  fi
+}
+
+# Function to setup MPFR
+setup_mpfr() {
+  if [ ! -d "mpfr-3.1.6" ]; then
+    info "Downloading and setting up MPFR"
+    wget https://www.mpfr.org/mpfr-3.1.6/mpfr-3.1.6.tar.xz || {
+      error "Failed to download MPFR"
+      exit 1
+    }
+    tar -xf mpfr-3.1.6.tar.xz || {
+      error "Failed to extract MPFR"
+      exit 1
+    }
+    rm mpfr-3.1.6.tar.xz
+  fi
+
+  if [ ! -L "gcc/mpfr" ]; then
+    ln -s ../mpfr-3.1.6 gcc/mpfr || {
+      error "Failed to create symlink for MPFR"
+      exit 1
+    }
+  fi
+}
+
+# Function to setup MPC
+setup_mpc() {
+  if [ ! -d "mpc-1.0.3" ]; then
+    info "Downloading and setting up MPC"
+    wget ftp://ftp.gnu.org/gnu/mpc/mpc-1.0.3.tar.gz || {
+      error "Failed to download MPC"
+      exit 1
+    }
+    tar -xf mpc-1.0.3.tar.gz || {
+      error "Failed to extract MPC"
+      exit 1
+    }
+    rm mpc-1.0.3.tar.gz
+  fi
+
+  if [ ! -L "gcc/mpc" ]; then
+    ln -s ../mpc-1.0.3 gcc/mpc || {
+      error "Failed to create symlink for MPC"
+      exit 1
+    }
+  fi
+}
+
+# Function to build binutils
+build_binutils() {
+  info "Building binutils"
+  mkdir -p binutils-gdb/build-binutils || {
+    error "Failed to create build directory for binutils"
+    exit 1
+  }
+
+  pushd binutils-gdb/build-binutils >/dev/null || {
+    error "Failed to change to binutils build directory"
+    exit 1
+  }
+
+  ../configure --target=or1k-elf --prefix="$OPENRISC_PREFIX" \
+    --disable-itcl \
+    --disable-tk \
+    --disable-tcl \
+    --disable-winsup \
+    --disable-gdbtk \
+    --disable-libgui \
+    --disable-rda \
+    --disable-sid \
+    --disable-sim \
+    --disable-gdb \
+    --with-sysroot \
+    --disable-newlib \
+    --disable-libgloss \
+    --with-system-zlib || {
+    error "Failed to configure binutils"
+    exit 1
+  }
+
+  make -j "$(nproc)" || {
+    error "Failed to build binutils"
+    exit 1
+  }
+
+  sudo make install || {
+    error "Failed to install binutils"
+    exit 1
+  }
+
+  popd >/dev/null
+  success "Binutils built and installed successfully"
+}
+
+# Function to build GCC stage1
+build_gcc_stage1() {
+  info "Building GCC stage1"
+  mkdir -p gcc/build-gcc-stage1 || {
+    error "Failed to create build directory for GCC stage1"
+    exit 1
+  }
+
+  pushd gcc/build-gcc-stage1 >/dev/null || {
+    error "Failed to change to GCC stage1 build directory"
+    exit 1
+  }
+
+  ../configure --target=or1k-elf \
+    --prefix="$OPENRISC_PREFIX" \
+    --enable-languages=c \
+    --disable-shared \
+    --disable-libssp || {
+    error "Failed to configure GCC stage1"
+    exit 1
+  }
+
+  make -j "$(nproc)" || {
+    error "Failed to build GCC stage1"
+    exit 1
+  }
+
+  sudo make install || {
+    error "Failed to install GCC stage1"
+    exit 1
+  }
+
+  popd >/dev/null
+  success "GCC stage1 built and installed successfully"
+}
+
+# Function to build newlib
+build_newlib() {
+  info "Building newlib"
+  mkdir -p newlib/build-newlib || {
+    error "Failed to create build directory for newlib"
+    exit 1
+  }
+
+  pushd newlib/build-newlib >/dev/null || {
+    error "Failed to change to newlib build directory"
+    exit 1
+  }
+
+  ../configure --target=or1k-elf --prefix="$OPENRISC_PREFIX" || {
+    error "Failed to configure newlib"
+    exit 1
+  }
+
+  make -j "$(nproc)" || {
+    error "Failed to build newlib"
+    exit 1
+  }
+
+  sudo make install || {
+    error "Failed to install newlib"
+    exit 1
+  }
+
+  popd >/dev/null
+  success "Newlib built and installed successfully"
+}
+
+# Function to build GCC stage2
+build_gcc_stage2() {
+  info "Building GCC stage2"
+  mkdir -p gcc/build-gcc-stage2 || {
+    error "Failed to create build directory for GCC stage2"
+    exit 1
+  }
+
+  pushd gcc/build-gcc-stage2 >/dev/null || {
+    error "Failed to change to GCC stage2 build directory"
+    exit 1
+  }
+
+  ../configure --target=or1k-elf \
+    --prefix="$OPENRISC_PREFIX" \
+    --enable-languages=c,c++ \
+    --disable-shared \
+    --disable-libssp \
+    --with-newlib || {
+    error "Failed to configure GCC stage2"
+    exit 1
+  }
+
+  make -j "$(nproc)" || {
+    error "Failed to build GCC stage2"
+    exit 1
+  }
+
+  sudo make install || {
+    error "Failed to install GCC stage2"
+    exit 1
+  }
+
+  popd >/dev/null
+  success "GCC stage2 built and installed successfully"
+}
+
+# Function to build GDB
+build_gdb() {
+  info "Building GDB"
+  mkdir -p binutils-gdb/build-gdb || {
+    error "Failed to create build directory for GDB"
+    exit 1
+  }
+
+  pushd binutils-gdb/build-gdb >/dev/null || {
+    error "Failed to change to GDB build directory"
+    exit 1
+  }
+
+  ../configure --target=or1k-elf \
+    --prefix="$OPENRISC_PREFIX" \
+    --disable-itcl \
+    --disable-tk \
+    --disable-tcl \
+    --disable-winsup \
+    --disable-gdbtk \
+    --disable-libgui \
+    --disable-rda \
+    --disable-sid \
+    --with-sysroot \
+    --disable-newlib \
+    --disable-libgloss \
+    --disable-gas \
+    --disable-ld \
+    --disable-binutils \
+    --disable-gprof \
+    --with-system-zlib || {
+    error "Failed to configure GDB"
+    exit 1
+  }
+
+  make -j "$(nproc)" || {
+    error "Failed to build GDB"
+    exit 1
+  }
+
+  sudo make install || {
+    error "Failed to install GDB"
+    exit 1
+  }
+
+  popd >/dev/null
+  success "GDB built and installed successfully"
+}
+
+# Function to parse arguments
+parse_arguments() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    --prefix=*)
+      OPENRISC_PREFIX="${1#*=}"
+      shift
+      ;;
+    --use-gmp)
+      USE_GMP=true
+      shift
+      ;;
+    --use-mpfr)
+      USE_MPFR=true
+      shift
+      ;;
+    --use-mpc)
+      USE_MPC=true
+      shift
+      ;;
+    --use-extra)
+      USE_GMP=true
+      USE_MPFR=true
+      USE_MPC=true
+      shift
+      ;;
+    --build-binutils)
+      BUILD_BINUTILS=true
+      shift
+      ;;
+    --build-gcc)
+      BUILD_GCC=true
+      shift
+      ;;
+    --build-gdb)
+      BUILD_GDB=true
+      shift
+      ;;
+    *)
+      error "Unknown option: $1"
+      exit 1
+      ;;
+    esac
+  done
+}
+
+# Main function
+main() {
+  parse_arguments "$@"
+
+  info "Starting OpenRISC toolchain build process"
+  info "Toolchain prefix: $OPENRISC_PREFIX"
+
+  setup_dependency
+  setup_work_dir
+  setup_prefix
+  clone_repos
+
+  # Setup extra libraries if needed
+  if $USE_GMP; then setup_gmp; fi
+  if $USE_MPFR; then setup_mpfr; fi
+  if $USE_MPC; then setup_mpc; fi
+
+  # Build components as requested
+  if $BUILD_BINUTILS; then build_binutils; fi
+
+  if $BUILD_GCC; then
+    build_gcc_stage1
+    build_newlib
+    build_gcc_stage2
+  fi
+
+  if $BUILD_GDB; then build_gdb; fi
+
+  success "OpenRISC toolchain build process completed successfully"
+}
+
+# Execute main function
+main "$@"
